@@ -1,0 +1,156 @@
+name: Mirror File Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Direct download URL of the file'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Download and process file
+        id: download
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          LOG_FILE="download_log.txt"
+          DOWNLOAD_DIR="downloads"
+          TMP_DIR=$(mktemp -d)
+
+          > "$LOG_FILE"
+
+          log() {
+            echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') $1" | tee -a "$LOG_FILE"
+          }
+
+          log "[INFO] Starting download"
+          log "[INFO] Input URL: $INPUT_URL"
+
+          cd "$TMP_DIR"
+          FILENAME=$(curl -L -J -O -w '%{filename_effective}' --progress-bar "$INPUT_URL" 2>curl_stderr.log)
+          CURL_EXIT=$?
+          cat curl_stderr.log >> "../$LOG_FILE"
+
+          if [ $CURL_EXIT -ne 0 ]; then
+            log "[ERROR] curl failed (exit code: $CURL_EXIT)"
+            exit 1
+          fi
+
+          log "[INFO] Original filename determined by server: $FILENAME"
+          cd - >/dev/null
+
+          # Clean previous leftovers for this exact filename
+          rm -f "$DOWNLOAD_DIR/$FILENAME" "$DOWNLOAD_DIR/$FILENAME.split.zip" "$DOWNLOAD_DIR/$FILENAME.split.z"*
+          mkdir -p "$DOWNLOAD_DIR"
+          mv "$TMP_DIR/$FILENAME" "$DOWNLOAD_DIR/$FILENAME"
+
+          FILEPATH="$DOWNLOAD_DIR/$FILENAME"
+          FILESIZE=$(stat -c %s "$FILEPATH")
+          HUMAN_SIZE=$(numfmt --to=iec --suffix=B "$FILESIZE" 2>/dev/null || echo "$FILESIZE bytes")
+          log "[INFO] Downloaded: $FILESIZE bytes ($HUMAN_SIZE)"
+
+          # Split if > 95 MiB (safe under GitHub's 100 MB limit)
+          SAFE_MAX=$((95 * 1024 * 1024))
+          if [ "$FILESIZE" -gt "$SAFE_MAX" ]; then
+            log "[INFO] File exceeds 95 MiB, splitting into 95 MiB multi‑part ZIP"
+            cd "$DOWNLOAD_DIR"
+            zip -0 -s 95m -r "${FILENAME}.split.zip" "$FILENAME" 2>&1 | tee -a "../$LOG_FILE"
+            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              log "[ERROR] ZIP split failed"
+              exit 1
+            fi
+            rm -f "$FILENAME"
+            cd ..
+
+            PARTS_INFO=""
+            # Only iterate over .split.zip and then numbered parts (.z01, .z02, ...)
+            for part in "$DOWNLOAD_DIR/$FILENAME.split.zip" "$DOWNLOAD_DIR/$FILENAME".split.z[0-9]*; do
+              [ -f "$part" ] || continue
+              P_SIZE=$(stat -c %s "$part")
+              P_HUMAN=$(numfmt --to=iec --suffix=B "$P_SIZE" 2>/dev/null || echo "$P_SIZE bytes")
+              PARTS_INFO+="$(basename "$part")|${P_SIZE}|${P_HUMAN}\n"
+            done
+
+            echo "split=true" >> "$GITHUB_OUTPUT"
+            echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+            echo "archive_basename=${FILENAME}.split" >> "$GITHUB_OUTPUT"
+            echo "parts_list<<EOF" >> "$GITHUB_OUTPUT"
+            echo -e "$PARTS_INFO" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            log "[INFO] File within safe limit, keeping original"
+            echo "split=false" >> "$GITHUB_OUTPUT"
+            echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
+            echo "filepath=$FILEPATH" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "filesize=$FILESIZE" >> "$GITHUB_OUTPUT"
+          echo "human_size=$HUMAN_SIZE" >> "$GITHUB_OUTPUT"
+          log "[INFO] Done"
+
+      - name: Commit log and files to the repository
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add download_log.txt
+          if [ -d downloads ]; then
+            git add downloads/
+          fi
+          git diff --cached --quiet || git commit -m "Mirror download: ${{ github.event.inputs.url }}"
+          git push
+
+      - name: Create job summary
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          SPLIT: ${{ steps.download.outputs.split }}
+          FILENAME: ${{ steps.download.outputs.filename }}
+          FILEPATH: ${{ steps.download.outputs.filepath }}
+          ARCHIVE_BASENAME: ${{ steps.download.outputs.archive_basename }}
+          FILESIZE: ${{ steps.download.outputs.filesize }}
+          HUMAN_SIZE: ${{ steps.download.outputs.human_size }}
+          PARTS_LIST: ${{ steps.download.outputs.parts_list }}
+        run: |
+          LOG_TEXT=$(cat download_log.txt 2>/dev/null || echo "No log file found")
+          {
+            echo "## Download Summary"
+            echo ""
+            if [ "$SPLIT" = "true" ]; then
+              echo "**Split archive parts** (download all parts, then open the \`.zip\` file):"
+              echo ""
+              while IFS='|' read -r partname bytes human; do
+                [ -z "$partname" ] && continue
+                echo "- [\`$partname\` ($human)](https://raw.githubusercontent.com/${REPO}/${BRANCH}/downloads/$partname)"
+              done <<< "$(echo -e "$PARTS_LIST")"
+              echo ""
+              echo "**Total original size:** \`$HUMAN_SIZE\`"
+              echo ""
+              echo "> **Reassembly:** Open \`${FILENAME}.split.zip\` with 7‑Zip, WinRAR, or WinZip. The \`.z01\`, \`.z02\` parts are read automatically."
+            elif [ -n "$FILEPATH" ]; then
+              echo "**Downloaded file:** [\`$FILENAME\` (${HUMAN_SIZE})](https://raw.githubusercontent.com/${REPO}/${BRANCH}/$FILEPATH)"
+            else
+              echo "❌ Download did **not** produce a usable file. Check the log below."
+            fi
+            echo ""
+            echo "### Detailed Log"
+            echo '```'
+            echo "$LOG_TEXT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
