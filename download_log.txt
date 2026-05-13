@@ -1,0 +1,6 @@
+2026-05-13T14:01:29Z [INFO] Starting download
+2026-05-13T14:01:29Z [INFO] Input URL: https://huggingface.co/stanfordnlp/glove/resolve/main/glove.6B.zip
+2026-05-13T14:01:31Z [INFO] Downloaded: 862182753 bytes (823MB)
+2026-05-13T14:01:31Z [INFO] File exceeds 95 MiB, splitting into 95 MiB multi‑part ZIP
+  adding: glove.6B.zip (stored 0%)
+2026-05-13T14:01:34Z [INFO] Done
